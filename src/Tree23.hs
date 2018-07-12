@@ -1,3 +1,5 @@
+{-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE TypeSynonymInstances #-}
@@ -6,6 +8,7 @@
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 module Tree23 where
 
 import GHC.Generics hiding (S)
@@ -19,12 +22,23 @@ import Control.Arrow ((***),(&&&))
 import Control.Applicative
 import Control.Monad
 
+-- These are all necessary to use the template haskell
+-- functionality; together with:
+--   {-# LANGUAGE PatternSynonyms MultiParamTypeClasses TemplateHaskell #-}
+--
+import Generics.MRSOP.Base
+import Generics.MRSOP.Util hiding (All, Nil, Cons)
+import Generics.MRSOP.Opaque
+import Generics.MRSOP.TH
+
 -- |2-3-Trees declaration
 data Tree23
   = Node2 Int Tree23 Tree23
   | Node3 Int Tree23 Tree23 Tree23
   | Leaf
   deriving (Eq , Show , Generic)
+
+deriveFamily [t| Tree23 |]
 
 instance Hashable Tree23
 
@@ -81,8 +95,6 @@ data Spine :: * -> * where
 
 deriving instance (Show x) => Show (Spine x)
 deriving instance (Eq x) => Eq (Spine x)
-
-data Nat = Z | S Nat
 
 -- |Alignments mixed with fixpoints already
 data Al :: Nat -> Nat -> * where
