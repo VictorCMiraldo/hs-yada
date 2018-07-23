@@ -29,47 +29,54 @@ enumNP NP0 = []
 enumNP (fx :* fxs) = Here fx : map There (enumNP fxs)
 
 trieFromTree :: Tree23 -> WordTrie [MyPath]
-trieFromTree t = go trieEmpty [(HoleW , t)]
+trieFromTree t = go trieEmpty [(id , t)]
   where
-    go :: WordTrie [MyPath] -> [(MyPath , Tree23)] -> WordTrie [MyPath]
+    -- CPS style for constructing paths
+    go :: WordTrie [MyPath] -> [(MyPath -> MyPath , Tree23)] -> WordTrie [MyPath]
     go tr []        = tr
     go tr ((_ , Leaf):ts) = go tr ts
-{-
-    go tr ((h , t):ts)    = go (trieAdd [h] (h:) (octets $ hash t) tr)
-                               (ts ++ map (mergePath h *** id) (zip [0..] $ children t))
--}
     go tr ((h , t):ts) = case sop (sfrom $ into @FamTree23 t) of
-      Tag c ps -> go (trieAdd [h] (h :) (octets $ hash t) tr)
-                     (ts ++ mapMaybe (goNS _ c) (enumNP ps))
+      Tag c ps -> go (trieAdd [h HoleW] (h HoleW :) (octets $ hash t) tr)
+                     (ts ++ mapMaybe (goNS h c) (enumNP ps))
 
     
 
     isRec :: NA Singl (El FamTree23) ix -> Maybe Tree23
-    isRec = _
+    isRec (NA_I x) 
+      = case getElSNat x of
+          SZ -> return $ unEl x
+    isRec _
+      = Nothing
 
-    constHole :: NA Singl (El FamTree23) a -> Maybe (Way CodesTree23 a)
-    constHole (NA_I _) = return HoleW
-    constHole _        = Nothing
+    constP :: MyPath -> NA Singl (El FamTree23) a -> Way CodesTree23 a
+    constP p (NA_I el)
+      = case getElSNat el of
+          SZ -> p
+    constP _ _        = error "constP"
 
+    -- The goNS function returns whatever tree was selected in the inj
+    -- into NS and returns the continuation by adding the hole at
+    -- that same injection.
     goNS :: IsNat c
          => (MyPath -> MyPath) -> Constr (Lkup Z CodesTree23) c
          -> NS (NA Singl (El FamTree23)) (Lkup c (Lkup Z (CodesTree23)))
-         -> Maybe (MyPath , Tree23)
-    goNS h c ns = do aux <- mapNSM constHole ns
-                     t   <- elimNS isRec ns
-                     return (h (Follow c aux) , t)
-{-
-    isRec uptohere (There rest) = isRec uptohere rest
-    isRec uptohere (Here  (NA_K _))  = Nothing
-    isRec uptohere (Here  (NA_I el))
-      = case getElSNat el of
-          SZ -> Just (HoleW , unEl el)
- 
-    mergePath :: MyPath -> Integer -> MyPath
-    mergePath p i = _
+         -> Maybe (MyPath -> MyPath , Tree23)
+    goNS h c ns = do t   <- elimNS isRec ns
+                     return ( h . Follow c . (\p -> mapNS (constP p) ns)
+                            , t)
 
--}
-{-
+-- |Again; we can keep the hashes around for a much more efficient
+--  version of this. Instead of Tree23; use Auth Tree23
+trieTreeLkup :: Tree23 -> WordTrie a -> Maybe a
+trieTreeLkup t = trieLkup (octets $ hash t)
+
+-- |given two trees, compute the tries of all of their subtrees and
+--  get their intersection
+preprocess :: Tree23 -> Tree23 -> WordTrie ([MyPath] , [MyPath])
+preprocess t1 t2 = trieZipWith (,) (trieFromTree t1) (trieFromTree t2)
+
+
+ {-
 -- |I'll keep a set that counts how many times each common subtree
 --  still shows up (and the path to it) in the source and destination.
 --
