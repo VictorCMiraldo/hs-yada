@@ -1,3 +1,5 @@
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE PolyKinds #-}
@@ -9,7 +11,9 @@ module Tree23_hashset where
 
 import Control.Arrow ((***),(&&&))
 import Data.Hashable
+import Data.Type.Equality
 import Data.Maybe (mapMaybe)
+import qualified Data.List as L
 import Control.Applicative
 import Control.Monad
 import Control.Monad.State
@@ -22,7 +26,6 @@ import Generics.MRSOP.Util hiding (Cons , Nil)
 import Generics.MRSOP.Treefix
 
 type MyPath = Way CodesTree23 (I Z)
-type DiffM = State (WordTrie ([MyPath] , [MyPath]))
 
 enumNP :: NP f xs -> [NS f xs]
 enumNP NP0 = []
@@ -38,8 +41,6 @@ trieFromTree t = go trieEmpty [(id , t)]
     go tr ((h , t):ts) = case sop (sfrom $ into @FamTree23 t) of
       Tag c ps -> go (trieAdd [h HoleW] (h HoleW :) (octets $ hash t) tr)
                      (ts ++ mapMaybe (goNS h c) (enumNP ps))
-
-    
 
     isRec :: NA Singl (El FamTree23) ix -> Maybe Tree23
     isRec (NA_I x) 
@@ -75,6 +76,146 @@ trieTreeLkup t = trieLkup (octets $ hash t)
 preprocess :: Tree23 -> Tree23 -> WordTrie ([MyPath] , [MyPath])
 preprocess t1 t2 = trieZipWith (,) (trieFromTree t1) (trieFromTree t2)
 
+data UTx :: (kon -> *) -> [*] -> [[[Atom kon]]] -> Nat -> * -> *  where
+  UTxHere :: x -> UTx ki fam codes i x
+  UTxPeel :: (IsNat n) => Constr (Lkup i codes) n
+         -> UTxNP ki fam codes (Lkup n (Lkup i codes)) x
+         -> UTx ki fam codes i x
+
+data UTxNP :: (kon -> *) -> [*] -> [[[Atom kon]]] -> [Atom kon] -> * -> *
+    where
+  UTxNPNil   :: UTxNP ki fam codes '[] x
+  UTxNPPath  :: (IsNat i)
+            => UTx ki fam codes i x
+            -> UTxNP ki fam codes prod x
+            -> UTxNP ki fam codes (I i ': prod) x
+  UTxNPSolid :: ki k
+            -> UTxNP ki fam codes prod x
+            -> UTxNP ki fam codes (K k ': prod) x
+
+utxGetX :: UTx ki fam codes i x -> [x]
+utxGetX utx = go utx []
+  where 
+    go :: UTx ki fam codes i x -> ([x] -> [x])
+    go (UTxHere x) = (x:)
+    go (UTxPeel _ xs)  = utxnpGetX xs
+
+    utxnpGetX :: UTxNP ki fam codes prod x -> ([x] -> [x])
+    utxnpGetX UTxNPNil = id
+    utxnpGetX (UTxNPSolid _ ps) = utxnpGetX ps
+    utxnpGetX (UTxNPPath i ps) = go i . utxnpGetX ps 
+
+deriving instance (Show1 ki , Show x) => Show (UTx ki fam codes i x)
+instance (Show1 ki , Show x) => Show (UTxNP ki fam codes prod x) where
+  show UTxNPNil = "Nil"
+  show (UTxNPPath p ps) = "(" ++ show p ++ ") :* " ++ show ps
+  show (UTxNPSolid ki ps) = show1 ki ++ " :* " ++ show ps
+
+data DiffState = DiffState 
+  { sharingMap :: WordTrie ([MyPath] , [MyPath])
+  , seenMap    :: WordTrie Int
+  , fresh      :: Int
+  }
+type DiffM = State DiffState
+
+-- The Int is used to "number" the hole. All holes with
+-- number "n" must be contracted in the source and
+-- map to holes with number "n" in the dest.
+type MyTreefix = UTx Singl FamTree23 CodesTree23 Z Int
+type MyTreefixNP prod = UTxNP Singl FamTree23 CodesTree23 prod Int
+
+issueHoleFor :: Tree23 -> DiffM MyTreefix
+issueHoleFor tr
+  = do res <- (trieTreeLkup tr . seenMap) <$> get
+       case res of
+         Just i -> return (UTxHere i)
+         Nothing -> do
+           i <- fresh <$> get
+           modify (\st -> st { seenMap = trieAdd i (const i) (octets $ hash tr) (seenMap st)
+                             , fresh   = i + 1
+                             })
+           return (UTxHere i)
+
+traverseConstr :: Tree23 -> DiffM MyTreefix
+traverseConstr tr
+  = case sop (sfrom $ into @FamTree23 tr) of
+      Tag ctr ptr -> UTxPeel ctr <$> go ptr
+  where
+    go :: PoA Singl (El FamTree23) prod
+       -> DiffM (MyTreefixNP prod)
+    go NP0 = return UTxNPNil
+    go (NA_K ki :* rest) = UTxNPSolid ki <$> go rest
+    go (NA_I vi :* rest)
+      = case getElSNat vi of
+          SZ -> UTxNPPath <$> getPathE (unEl vi)
+                          <*> go rest
+
+getPathE :: Tree23 -> DiffM MyTreefix
+getPathE tr
+  = do res <- (trieTreeLkup tr . sharingMap) <$> get
+       case res of
+         Nothing           -> traverseConstr tr
+         Just (others , _) -> issueHoleFor tr
+
+runDiffMWithSharing :: WordTrie ([MyPath] , [MyPath])
+                    -> DiffM a -> a
+runDiffMWithSharing sharing dm
+  = evalState dm (DiffState sharing trieEmpty 0)
+
+experiment :: Tree23 -> Tree23 -> (MyTreefix , MyTreefix)
+experiment t u
+  = let sharing = preprocess t u
+     in runDiffMWithSharing sharing $
+       do del <- getPathE t
+          ins <- getPathE u
+          -- Now, we might be computing something with too much sharing.
+          -- We must go over the holes in both UTx's and
+          -- remove those that do not appear in the other place
+          -- by replacing them with a tree.
+          -- let keysD = L.nub $ utxGetX del
+          -- let keysI = L.nub $ utxGetX ins
+          -- let del' = replaceHoles (keysD L.\\ keysI) t del
+          -- let ins' = replaceHoles (keysI L.\\ keysD) u ins
+          -- return (del' , ins')
+          return (del , ins)
+
+makeSolidTx :: Tree23 -> MyTreefix
+makeSolidTx t
+  = case sop (sfrom $ into @FamTree23 t) of
+      Tag c p -> UTxPeel c (go p)
+  where
+    go :: PoA Singl (El FamTree23) prod
+       -> MyTreefixNP prod
+    go NP0 = UTxNPNil
+    go (NA_K ki :* rest) = UTxNPSolid ki (go rest)
+    go (NA_I vi :* rest)
+      = case getElSNat vi of
+          SZ -> UTxNPPath (makeSolidTx (unEl vi)) (go rest)
+
+replaceHoles :: [Int] -> Tree23 -> MyTreefix -> MyTreefix
+replaceHoles [] _ = id
+replaceHoles xs t = replaceHoles' xs t
+
+-- predondition: the treefix is a valid treefix for t
+replaceHoles' :: [Int] -> Tree23 -> MyTreefix -> MyTreefix
+replaceHoles' ks t (UTxHere x)
+  | x `elem` ks = makeSolidTx t
+  | otherwise   = UTxHere x
+replaceHoles' ks t (UTxPeel c1 txnp)
+  = case sop (sfrom $ into @FamTree23 t) of
+      Tag c2 p -> case testEquality c1 c2 of
+        Nothing   -> error "precondition failure"
+        Just Refl -> UTxPeel c1 (replaceHolesNP ks p txnp)
+  where
+    replaceHolesNP :: [Int] -> PoA Singl (El FamTree23) prod
+                   -> MyTreefixNP prod
+                   -> MyTreefixNP prod
+    replaceHolesNP ks NP0 _ = UTxNPNil
+    replaceHolesNP ks (_ :* as) (UTxNPSolid ki rest)
+      = UTxNPSolid ki $ replaceHolesNP ks as rest
+    replaceHolesNP ks (NA_I a :* as) (UTxNPPath i rest)
+      = case getElSNat a of
+         SZ -> UTxNPPath (replaceHoles' ks (unEl a) i) (replaceHolesNP ks as rest)
 
  {-
 -- |I'll keep a set that counts how many times each common subtree
