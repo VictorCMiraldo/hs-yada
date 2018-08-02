@@ -1,3 +1,6 @@
+{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE GADTs #-}
@@ -9,7 +12,6 @@
 {-# LANGUAGE TypeApplications #-}
 module Tree23_hashset where
 
-import Control.Arrow ((***),(&&&))
 import Data.Hashable
 import Data.Type.Equality
 import Data.Maybe (mapMaybe)
@@ -17,6 +19,9 @@ import qualified Data.List as L
 import Control.Applicative
 import Control.Monad
 import Control.Monad.State
+import Data.Proxy
+
+import qualified Data.Map as M
 
 import Tree23 hiding (Hole)
 import WordTrie
@@ -105,10 +110,13 @@ utxGetX utx = go utx []
     utxnpGetX (UTxNPSolid _ ps) = utxnpGetX ps
     utxnpGetX (UTxNPPath i ps) = go i . utxnpGetX ps 
 
-deriving instance (Show1 ki , Show x) => Show (UTx ki fam codes i x)
+instance (Show1 ki , Show x) => Show (UTx ki fam codes i x) where
+  show (UTxHere x) = "[" ++ show x ++ "]"
+  show (UTxPeel c rest) = "(" ++ show c ++ "| " ++ show rest ++ ")"
+
 instance (Show1 ki , Show x) => Show (UTxNP ki fam codes prod x) where
   show UTxNPNil = "Nil"
-  show (UTxNPPath p ps) = "(" ++ show p ++ ") :* " ++ show ps
+  show (UTxNPPath p ps) = show p ++ " :* " ++ show ps
   show (UTxNPSolid ki ps) = show1 ki ++ " :* " ++ show ps
 
 data DiffState = DiffState 
@@ -172,13 +180,13 @@ experiment t u
           -- We must go over the holes in both UTx's and
           -- remove those that do not appear in the other place
           -- by replacing them with a tree.
-          -- let keysD = L.nub $ utxGetX del
-          -- let keysI = L.nub $ utxGetX ins
-          -- let del' = replaceHoles (keysD L.\\ keysI) t del
-          -- let ins' = replaceHoles (keysI L.\\ keysD) u ins
-          -- return (del' , ins')
-          return (del , ins)
+          let keysD = L.nub $ utxGetX del
+          let keysI = L.nub $ utxGetX ins
+          let del' = replaceHoles (keysD L.\\ keysI) t del
+          let ins' = replaceHoles (keysI L.\\ keysD) u ins
+          return (del' , ins')
 
+-- Given a tree, produces a Tx with no holes.
 makeSolidTx :: Tree23 -> MyTreefix
 makeSolidTx t
   = case sop (sfrom $ into @FamTree23 t) of
@@ -216,6 +224,86 @@ replaceHoles' ks t (UTxPeel c1 txnp)
     replaceHolesNP ks (NA_I a :* as) (UTxNPPath i rest)
       = case getElSNat a of
          SZ -> UTxNPPath (replaceHoles' ks (unEl a) i) (replaceHolesNP ks as rest)
+
+instance Eq1 (El FamTree23) where
+  eq1 ex@(El x) (El y)
+    = case getElSNat ex of
+        SZ -> x == y
+
+data ElEx :: [*] -> * where
+  SomeEl :: (IsNat ix) => El fam ix -> ElEx fam
+
+instance Show (ElEx FamTree23) where
+  show (SomeEl e) = case getElSNat e of
+    SZ -> show (unEl e)
+
+
+
+assertElExIs :: (Eq1 (El fam) , IsNat iy) => ElEx fam -> El fam iy -> Bool
+assertElExIs (SomeEl ex) ey
+  = case testEquality (getElSNat ex) (getElSNat ey) of
+      Nothing   -> False
+      Just Refl -> eq1 ex ey
+
+utxProj :: MyTreefix -> Tree23 -> Maybe (M.Map Int (ElEx FamTree23))
+utxProj utx t = go utx t M.empty
+  where
+    assertLkupIs :: Int -> Tree23 -> M.Map Int (ElEx FamTree23) -> Bool
+    assertLkupIs n t m
+      = let (Just elex) = M.lookup n m
+         in assertElExIs elex (into @FamTree23 t)
+    
+    go :: MyTreefix -> Tree23 -> M.Map Int (ElEx FamTree23)
+       -> Maybe (M.Map Int (ElEx FamTree23))
+    go (UTxHere n) t m
+      | n `M.member` m = guard (assertLkupIs n t m) >> return m
+      | otherwise      = Just (M.insert n (SomeEl (into @FamTree23 t)) m)
+    go (UTxPeel c utxnp) t m
+      = case sop (sfrom $ into @FamTree23 t) of
+          Tag c2 p -> case testEquality c c2 of
+            Nothing   -> Nothing
+            Just Refl -> goNP utxnp p m
+
+    goNP :: MyTreefixNP prod -> PoA Singl (El FamTree23) prod
+         -> M.Map Int (ElEx FamTree23)
+         -> Maybe (M.Map Int (ElEx FamTree23))
+    goNP UTxNPNil _ m = Just m
+    goNP (UTxNPSolid k utxnp) (NA_K ak :* p) m
+      | eq1 k ak  = goNP utxnp p m
+      | otherwise = Nothing
+    goNP (UTxNPPath utx utxnp) (NA_I i :* p) m
+      = case getElSNat i of
+          SZ -> go utx (unEl i) m >>= goNP utxnp p
+
+utxInj :: MyTreefix -> M.Map Int (ElEx FamTree23) -> Maybe Tree23
+utxInj utx m = unEl <$> utxInjEl utx m
+  
+utxInjEl :: (IsNat i)
+         => UTx Singl FamTree23 CodesTree23 i Int
+         -> M.Map Int (ElEx FamTree23)
+         -> Maybe (El FamTree23 i)
+utxInjEl utx@(UTxHere x) m = M.lookup x m >>= \(SomeEl el)
+  -> case testEquality (getElSNat el) (getUTxSNat utx) of
+       Nothing -> Nothing
+       Just Refl -> Just el
+  where
+    getUTxSNat :: (IsNat i) => UTx ki fam codes i x -> SNat i
+    getUTxSNat utx = getSNat (getUTxProxy utx)
+
+    getUTxProxy :: UTx ki fam codes i x -> Proxy i
+    getUTxProxy utx = Proxy
+
+
+utxInjEl (UTxPeel c utxnp) m
+  = (sto . inj c) <$> utxnpInj utxnp m
+  where
+    utxnpInj :: MyTreefixNP prod -> M.Map Int (ElEx FamTree23)
+             -> Maybe (PoA Singl (El FamTree23) prod)
+    utxnpInj UTxNPNil _ = Just NP0
+    utxnpInj (UTxNPSolid a rest) m = (NA_K a :*) <$> utxnpInj rest m
+    utxnpInj (UTxNPPath i rest) m
+      = (:*) <$> (NA_I <$> utxInjEl i m) <*> utxnpInj rest m
+   
 
  {-
 -- |I'll keep a set that counts how many times each common subtree
@@ -269,6 +357,20 @@ mt1 = Node2 10 Leaf Leaf
 mt2 = Node3 20 Leaf mt1 Leaf
 mt3 = Node2 30 Leaf Leaf
 mt4 = Node3 50 mt1 mt2 mt3
+
+big1 , big2 , big3 :: Tree23
+big1 = Node3 100
+        (Node2 200 mt4 mt3)
+        (Node2 100 Leaf mt1)
+        (Node3 300 Leaf mt4 Leaf)
+big3 = Node3 100
+        (Node2 200 mt4 mt3)
+        (Node2 100 Leaf mt1)
+        (Node3 300 Leaf Leaf Leaf)
+
+big2 = Node2 100
+        (Node2 800 mt4 mt3)
+        (Node2 200 mt4 (Node3 300 mt1 mt3 Leaf))
 
 {-
   
